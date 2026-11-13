@@ -33,10 +33,13 @@
   #bar button { font: inherit; font-size:15px; border:1px solid rgba(255,190,130,.35); border-radius:999px;
     padding:10px 18px; background:rgba(20,8,2,.6); color:#ffe9d2; cursor:pointer; backdrop-filter: blur(6px); }
   #bar button.primary { background:var(--orange); color:#2a0d00; border-color:transparent; font-weight:bold; }
-  #hint { position:fixed; top:16px; left:50%; transform:translateX(-50%); z-index:4; font-size:14px;
+  #hint { position:fixed; top:calc(40px + env(safe-area-inset-top)); left:50%; transform:translateX(-50%); z-index:4; font-size:14px;
     background:rgba(20,8,2,.55); padding:6px 14px; border-radius:999px; transition: opacity .4s; }
   #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; z-index:6; }
   .hidden { display:none !important; }
+  #diag { position:fixed; left:8px; top:calc(8px + env(safe-area-inset-top)); z-index:4; font:11px/1.3 ui-monospace, Menlo, monospace;
+    color:#ffd9b0; background:rgba(0,0,0,.45); padding:3px 7px; border-radius:6px; max-width:70vw; pointer-events:none; }
+  #diag:empty { display:none; }
 </style>
 </head>
 <body>
@@ -54,6 +57,7 @@
   <button id="glowBtn" title="Toggle candle flicker">Flicker: on</button>
 </div>
 <div id="flash"></div>
+<div id="diag"></div>
 
 <div id="intro">
   <h1>🎃 Pumpkin Head</h1>
@@ -282,13 +286,61 @@ function blend(bs, name) {
   return c ? c.score : 0;
 }
 
-let lastVideoTime = -1, seenFace = false;
+/* Frames are copied into a small 2D canvas before tracking. Passing the <video>
+   straight to the tracker gives blank frames on some phones (notably iOS Safari),
+   which looks exactly like "no face found". */
+const frameCv = document.createElement("canvas");
+const frameCtx = frameCv.getContext("2d", { willReadFrequently: false });
+const FRAME_MAX = 640;
+
+let seenFace = false, lastTs = 0, framesNoFace = 0, delegateInUse = "", fallingBack = false;
+let fpsCount = 0, fpsT0 = performance.now(), fps = 0, lastError = "";
+const diag = $("diag");
+
+function grabFrame() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const s = Math.min(1, FRAME_MAX / Math.max(vw, vh));
+  const fw = Math.round(vw * s), fh = Math.round(vh * s);
+  if (frameCv.width !== fw || frameCv.height !== fh) { frameCv.width = fw; frameCv.height = fh; }
+  frameCtx.drawImage(video, 0, 0, fw, fh);
+  return frameCv;
+}
+
+async function fallbackToCPU(reason) {
+  if (fallingBack || delegateInUse === "CPU") return;
+  fallingBack = true;
+  console.warn("Switching tracker to CPU:", reason);
+  try {
+    const old = landmarker; landmarker = null;
+    landmarker = await createLandmarker("CPU");
+    delegateInUse = "CPU"; framesNoFace = 0;
+    try { old && old.close(); } catch (_) {}
+  } catch (e) { lastError = "CPU tracker failed: " + (e.message || e); }
+  fallingBack = false;
+}
+
 function loop(now) {
   requestAnimationFrame(loop);
-  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    const res = landmarker.detectForVideo(video, now);
-    const faces = res.faceLandmarks || [];
+  if (W !== (video.videoWidth || W) || H !== (video.videoHeight || H)) layout();
+  if (landmarker && !fallingBack && video.readyState >= 2) {
+    const frame = grabFrame();
+    if (!frame) { renderer.render(scene, camera); return; }
+    let res;
+    const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;  // must strictly increase
+    try { res = landmarker.detectForVideo(frame, ts); }
+    catch (e) {
+      lastError = String(e.message || e);
+      console.error(e);
+      fallbackToCPU("detect threw: " + lastError);
+      renderer.render(scene, camera); return;
+    }
+    const faces = (res && res.faceLandmarks) || [];
+    if (faces.length) framesNoFace = 0;
+    else if (++framesNoFace > 120 && delegateInUse === "GPU") fallbackToCPU("GPU found no faces for 120 frames");
+    fpsCount++;
+    if (now - fpsT0 > 1000) { fps = Math.round(fpsCount * 1000 / (now - fpsT0)); fpsCount = 0; fpsT0 = now; }
+    diag.textContent = `${delegateInUse} · ${fps} fps · ${frame.width}×${frame.height} · faces: ${faces.length}` + (lastError ? ` · ${lastError}` : "");
     pumpkins.forEach((p, i) => {
       const lm = faces[i];
       if (!lm) return p.hide();
@@ -322,14 +374,23 @@ async function startCamera() {
   layout();
 }
 
-async function loadLandmarker() {
-  const fileset = await FilesetResolver.forVisionTasks(MP_WASM);
-  const opts = (delegate) => ({
+let fileset = null;
+async function createLandmarker(delegate) {
+  if (!fileset) fileset = await FilesetResolver.forVisionTasks(MP_WASM);
+  return FaceLandmarker.createFromOptions(fileset, {
     baseOptions: { modelAssetPath: MP_MODEL, delegate },
     runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: true,
+    minFaceDetectionConfidence: 0.3, minFacePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
   });
-  try { return await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
-  catch (e) { console.warn("GPU delegate failed, using CPU", e); return await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+async function loadLandmarker() {
+  // ?cpu in the URL forces the CPU tracker (useful for testing).
+  const forceCPU = /[?&]cpu\b/.test(location.search);
+  if (!forceCPU) {
+    try { const lm = await createLandmarker("GPU"); delegateInUse = "GPU"; return lm; }
+    catch (e) { console.warn("GPU delegate failed, using CPU", e); }
+  }
+  const lm = await createLandmarker("CPU"); delegateInUse = "CPU"; return lm;
 }
 
 $("startBtn").addEventListener("click", async () => {
