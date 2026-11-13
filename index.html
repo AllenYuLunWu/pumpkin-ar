@@ -61,7 +61,7 @@
 
 <div id="intro">
   <h1>🎃 Pumpkin Head</h1>
-  <p>Allow camera access and your head turns into a jack-o'-lantern. Open your mouth to make it grin wider, and blink to make it blink.</p>
+  <p>Allow camera access and a jack-o'-lantern hat appears on your head. Open your mouth to make it grin wider, and blink to make it blink.</p>
   <button id="startBtn" class="big">Start camera</button>
   <div id="status"></div>
 </div>
@@ -73,6 +73,8 @@ import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
 const MP_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 const MAX_FACES = 3;
+const PUMPKIN_SIZE = 0.62;  // pumpkin radius as a fraction of face width
+const HEAD_GAP = 0.28;      // distance from top of forehead to crown, as a fraction of face height
 
 const $ = (id) => document.getElementById(id);
 const video = $("video"), stage = $("stage"), glCanvas = $("gl");
@@ -274,10 +276,12 @@ function poseFromLandmarks(lm) {
   y.crossVectors(z, x).normalize();
   m.makeBasis(x, y, z); q.setFromRotationMatrix(m);
   const faceW = P(lm, 454, a).distanceTo(P(lm, 234, b));
-  const radius = Math.max(0.78 * faceW, 0.74 * faceH);
-  c.addVectors(top, chin).multiplyScalar(0.5)
-    .addScaledVector(y, 0.06 * faceH)
-    .addScaledVector(z, -0.35 * radius);
+  // Pumpkin sits on top of the head like a hat. Landmark 10 is the top of the
+  // forehead; the crown of the skull is roughly HEAD_GAP face-heights above it.
+  const radius = PUMPKIN_SIZE * faceW;
+  c.copy(top)
+    .addScaledVector(y, HEAD_GAP * faceH + 0.84 * radius * 0.85) // 0.84 = squashed half-height; 0.85 = sink in a little
+    .addScaledVector(z, -0.45 * faceW);                         // centre it over the skull, not the forehead
   return { pos: c.clone(), quat: q.clone(), radius };
 }
 function blend(bs, name) {
@@ -384,9 +388,10 @@ async function createLandmarker(delegate) {
   });
 }
 async function loadLandmarker() {
-  // ?cpu in the URL forces the CPU tracker (useful for testing).
-  const forceCPU = /[?&]cpu\b/.test(location.search);
-  if (!forceCPU) {
+  // CPU is the default: the GPU tracker silently finds no faces on some phones.
+  // Add ?gpu to the URL to try the GPU tracker.
+  const tryGPU = /[?&]gpu\b/.test(location.search);
+  if (tryGPU) {
     try { const lm = await createLandmarker("GPU"); delegateInUse = "GPU"; return lm; }
     catch (e) { console.warn("GPU delegate failed, using CPU", e); }
   }
