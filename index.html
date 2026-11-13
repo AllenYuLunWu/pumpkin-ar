@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Pumpkin Head AR</title>
+<style>
+  :root { --orange:#ff7a18; --ink:#140a05; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; background:var(--ink); color:#ffe9d2; overflow:hidden;
+    font-family: "Trebuchet MS", system-ui, sans-serif; }
+  #viewport { position:fixed; inset:0; overflow:hidden; }
+  #stage { position:absolute; left:50%; top:50%; transform-origin:center; }
+  #stage.mirror { transform: translate(-50%,-50%) scaleX(-1); }
+  #stage:not(.mirror) { transform: translate(-50%,-50%); }
+  #stage video, #stage canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #vignette { position:fixed; inset:0; pointer-events:none;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(20,6,0,.65) 100%); }
+
+  #intro { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:18px; text-align:center; padding:24px;
+    background: radial-gradient(circle at 50% 40%, #3a1606 0%, #140a05 70%); z-index:5; }
+  #intro h1 { font-size: clamp(32px, 7vw, 64px); letter-spacing:.04em; color:var(--orange);
+    text-shadow: 0 0 24px rgba(255,122,24,.6); }
+  #intro p { max-width: 420px; opacity:.85; line-height:1.5; }
+  .big { font: inherit; font-size:20px; font-weight:bold; border:0; border-radius:999px; padding:14px 34px;
+    background: var(--orange); color:#2a0d00; cursor:pointer; box-shadow:0 0 30px rgba(255,122,24,.5); }
+  .big:disabled { opacity:.6; cursor:wait; }
+  #status { min-height:1.4em; font-size:14px; opacity:.8; }
+
+  #bar { position:fixed; left:0; right:0; bottom:0; display:flex; justify-content:center; gap:12px;
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); z-index:4; }
+  #bar button { font: inherit; font-size:15px; border:1px solid rgba(255,190,130,.35); border-radius:999px;
+    padding:10px 18px; background:rgba(20,8,2,.6); color:#ffe9d2; cursor:pointer; backdrop-filter: blur(6px); }
+  #bar button.primary { background:var(--orange); color:#2a0d00; border-color:transparent; font-weight:bold; }
+  #hint { position:fixed; top:16px; left:50%; transform:translateX(-50%); z-index:4; font-size:14px;
+    background:rgba(20,8,2,.55); padding:6px 14px; border-radius:999px; transition: opacity .4s; }
+  #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; z-index:6; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <div id="stage" class="mirror">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="gl"></canvas>
+  </div>
+</div>
+<div id="vignette"></div>
+<div id="hint" class="hidden">Looking for faces…</div>
+<div id="bar" class="hidden">
+  <button id="flipBtn" title="Switch camera">Flip camera</button>
+  <button id="snapBtn" class="primary">Snap photo</button>
+  <button id="glowBtn" title="Toggle candle flicker">Flicker: on</button>
+</div>
+<div id="flash"></div>
+
+<div id="intro">
+  <h1>🎃 Pumpkin Head</h1>
+  <p>Allow camera access and your head turns into a jack-o'-lantern. Open your mouth to make it grin wider, and blink to make it blink.</p>
+  <button id="startBtn" class="big">Start camera</button>
+  <div id="status"></div>
+</div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MP_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const MAX_FACES = 3;
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), stage = $("stage"), glCanvas = $("gl");
+const statusEl = $("status"), hint = $("hint");
+
+let landmarker = null, stream = null, facing = "user", flicker = true;
+let W = 640, H = 480;
+
+/* ---------------- three.js scene ---------------- */
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+// Orthographic camera in video-pixel units: x right, y up (we negate image y), z toward the viewer.
+const camera = new THREE.OrthographicCamera(0, W, 0, -H, -10000, 10000);
+camera.position.z = 5000;
+
+scene.add(new THREE.HemisphereLight(0xffe2c0, 0x2a1000, 1.1));
+const key = new THREE.DirectionalLight(0xffd6a0, 1.6);
+key.position.set(-0.4, 0.8, 1); scene.add(key);
+const rim = new THREE.DirectionalLight(0xff8a3a, 0.9);
+rim.position.set(0.8, 0.2, -0.6); scene.add(rim);
+
+/* Pumpkin body: a sphere pushed into ribs and squashed. */
+function makePumpkinGeometry() {
+  const g = new THREE.SphereGeometry(1, 120, 80);
+  const pos = g.attributes.position, v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    const phi = Math.atan2(v.z, -v.x);           // matches SphereGeometry's u direction
+    const s = Math.sqrt(v.x * v.x + v.z * v.z);   // distance from vertical axis
+    const rib = Math.pow(Math.abs(Math.sin(5 * phi)), 0.55); // 10 ribs; 0 in grooves
+    const r = 1 - 0.085 * (1 - rib) * s;
+    v.x *= r; v.z *= r;
+    // squash + dimple top and bottom
+    v.y = v.y * 0.84 - 0.16 * Math.sign(v.y) * Math.pow(Math.abs(v.y), 7);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+const pumpkinGeo = makePumpkinGeometry();
+
+function makeStem() {
+  const grp = new THREE.Group();
+  const stemGeo = new THREE.CylinderGeometry(0.07, 0.13, 0.36, 10, 6);
+  const p = stemGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {     // bend the stem a little
+    const y = p.getY(i) + 0.18;
+    p.setX(i, p.getX(i) + 0.25 * y * y);
+  }
+  stemGeo.computeVertexNormals();
+  const stem = new THREE.Mesh(stemGeo, new THREE.MeshStandardMaterial({ color: 0x5b4a1c, roughness: 0.9 }));
+  stem.position.y = 0.86;
+  stem.rotation.z = -0.15;
+  grp.add(stem);
+  const leaf = new THREE.Mesh(
+    new THREE.SphereGeometry(0.16, 16, 8).scale(1.3, 0.12, 0.7),
+    new THREE.MeshStandardMaterial({ color: 0x3f6b22, roughness: 0.8 })
+  );
+  leaf.position.set(-0.16, 0.78, 0.05); leaf.rotation.z = 0.5;
+  grp.add(leaf);
+  return grp;
+}
+
+/* Face texture: drawn on canvases so the mouth & eyes can animate.
+   Texture is 1024x512 equirect; front of sphere (+z) is at u = 0.25 -> x = 256. */
+const TW = 1024, TH = 512;
+function drawSkin(ctx) {
+  const grd = ctx.createLinearGradient(0, 0, 0, TH);
+  grd.addColorStop(0, "#c94f05"); grd.addColorStop(0.5, "#ff7f1a"); grd.addColorStop(1, "#b84303");
+  ctx.fillStyle = grd; ctx.fillRect(0, 0, TW, TH);
+  for (let k = 0; k <= 10; k++) {                // dark grooves at sin(5φ)=0
+    const x = k * TW / 10;
+    const g = ctx.createLinearGradient(x - 40, 0, x + 40, 0);
+    g.addColorStop(0, "rgba(120,30,0,0)"); g.addColorStop(0.5, "rgba(120,30,0,.55)"); g.addColorStop(1, "rgba(120,30,0,0)");
+    ctx.fillStyle = g; ctx.fillRect(x - 40, 0, 80, TH);
+  }
+  for (let i = 0; i < 260; i++) {               // speckles
+    ctx.fillStyle = `rgba(255,${180 + Math.random() * 60},90,${Math.random() * 0.12})`;
+    ctx.beginPath(); ctx.arc(Math.random() * TW, Math.random() * TH, Math.random() * 3 + 1, 0, 7); ctx.fill();
+  }
+}
+function faceShapes(ctx, st) {
+  const cx = 256, cy = 268;
+  // Eyes: triangles. Viewer's right (+x) is the pumpkin's own left eye.
+  const eye = (ex, blink) => {
+    const h = 58 * (1 - 0.92 * blink), w = 46;
+    ctx.beginPath();
+    ctx.moveTo(ex - w, cy - 40); ctx.lineTo(ex + w, cy - 40); ctx.lineTo(ex, cy - 40 - h);
+    ctx.closePath(); ctx.fill();
+  };
+  eye(cx - 72, st.blinkR);
+  eye(cx + 72, st.blinkL);
+  // Nose
+  ctx.beginPath(); ctx.moveTo(cx - 16, cy + 4); ctx.lineTo(cx + 16, cy + 4); ctx.lineTo(cx, cy - 22); ctx.closePath(); ctx.fill();
+  // Mouth: jagged grin that opens with jawOpen and curls with smile
+  const mw = 128 + 22 * st.smile, top = cy + 30, open = 18 + 78 * st.jaw, curl = 26 + 22 * st.smile;
+  ctx.beginPath();
+  ctx.moveTo(cx - mw, top - curl);
+  const teeth = 6;
+  for (let i = 1; i <= teeth * 2; i++) {        // upper lip with teeth
+    const t = i / (teeth * 2), x = cx - mw + 2 * mw * t;
+    const base = top - curl * Math.pow(2 * t - 1, 2);
+    const tooth = (i % 2 === 1 && i !== teeth * 2) ? 16 + 10 * (1 - st.jaw) : 0;
+    ctx.lineTo(x, base + tooth);
+  }
+  // lower lip, curving down
+  for (let i = 20; i >= 0; i--) {
+    const t = i / 20, x = cx - mw + 2 * mw * t, e = 2 * t - 1;
+    const y = top - curl * e * e + open * (1 - e * e) + 6;
+    const tooth = (i === 7 || i === 13) ? -14 * (1 - st.jaw * 0.6) : 0;
+    ctx.lineTo(x, y + tooth);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+class Pumpkin {
+  constructor() {
+    this.colorCv = Object.assign(document.createElement("canvas"), { width: TW, height: TH });
+    this.glowCv = Object.assign(document.createElement("canvas"), { width: TW, height: TH });
+    this.skin = Object.assign(document.createElement("canvas"), { width: TW, height: TH });
+    drawSkin(this.skin.getContext("2d"));
+    this.map = new THREE.CanvasTexture(this.colorCv); this.map.colorSpace = THREE.SRGBColorSpace;
+    this.emap = new THREE.CanvasTexture(this.glowCv); this.emap.colorSpace = THREE.SRGBColorSpace;
+    this.mat = new THREE.MeshStandardMaterial({
+      map: this.map, emissiveMap: this.emap, emissive: 0xffffff, emissiveIntensity: 1.4,
+      roughness: 0.55, metalness: 0.0,
+    });
+    this.group = new THREE.Group();
+    this.group.add(new THREE.Mesh(pumpkinGeo, this.mat));
+    this.group.add(makeStem());
+    this.group.visible = false;
+    scene.add(this.group);
+    this.state = { jaw: 0, blinkL: 0, blinkR: 0, smile: 0 };
+    this.drawn = null;
+    this.pos = new THREE.Vector3(); this.quat = new THREE.Quaternion(); this.scale = 1; this.fresh = true;
+    this.redraw();
+  }
+  redraw() {
+    const s = this.state;
+    const c = this.colorCv.getContext("2d");
+    c.drawImage(this.skin, 0, 0);
+    c.fillStyle = "#ffc44a"; faceShapes(c, s);
+    const g = this.glowCv.getContext("2d");
+    g.fillStyle = "#000"; g.fillRect(0, 0, TW, TH);
+    g.shadowColor = "#ffb000"; g.shadowBlur = 18;
+    g.fillStyle = "#ffd25a"; faceShapes(g, s);
+    g.shadowBlur = 0;
+    this.map.needsUpdate = true; this.emap.needsUpdate = true;
+    this.drawn = { ...s };
+  }
+  setExpression(jaw, blinkL, blinkR, smile) {
+    const s = this.state, k = 0.5;
+    s.jaw += (jaw - s.jaw) * k; s.blinkL += (blinkL - s.blinkL) * k;
+    s.blinkR += (blinkR - s.blinkR) * k; s.smile += (smile - s.smile) * k;
+    const d = this.drawn;
+    if (Math.abs(d.jaw - s.jaw) + Math.abs(d.blinkL - s.blinkL) + Math.abs(d.blinkR - s.blinkR) + Math.abs(d.smile - s.smile) > 0.04) this.redraw();
+  }
+  setPose(pos, quat, scale) {
+    if (this.fresh) { this.pos.copy(pos); this.quat.copy(quat); this.scale = scale; this.fresh = false; }
+    else { this.pos.lerp(pos, 0.55); this.quat.slerp(quat, 0.5); this.scale += (scale - this.scale) * 0.45; }
+    this.group.position.copy(this.pos);
+    this.group.quaternion.copy(this.quat);
+    this.group.scale.setScalar(this.scale);
+    this.group.visible = true;
+  }
+  hide() { this.group.visible = false; this.fresh = true; }
+}
+const pumpkins = Array.from({ length: MAX_FACES }, () => new Pumpkin());
+
+/* ---------------- layout ---------------- */
+function layout() {
+  W = video.videoWidth || 640; H = video.videoHeight || 480;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(vw / W, vh / H);           // "cover" the screen
+  const sw = Math.round(W * s), sh = Math.round(H * s);
+  stage.style.width = sw + "px"; stage.style.height = sh + "px";
+  renderer.setSize(sw, sh, false);
+  camera.left = 0; camera.right = W; camera.top = 0; camera.bottom = -H;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", layout);
+
+/* ---------------- tracking ---------------- */
+const tmp = { a: new THREE.Vector3(), b: new THREE.Vector3(), x: new THREE.Vector3(), y: new THREE.Vector3(), z: new THREE.Vector3(), m: new THREE.Matrix4(), q: new THREE.Quaternion(), c: new THREE.Vector3() };
+const P = (lm, i, out) => out.set(lm[i].x * W, -lm[i].y * H, -lm[i].z * W);
+
+function poseFromLandmarks(lm) {
+  const { a, b, x, y, z, m, q, c } = tmp;
+  // x axis: subject's right eye outer (33) -> left eye outer (263)
+  P(lm, 263, a); P(lm, 33, b); x.subVectors(a, b).normalize();
+  // up: chin (152) -> forehead (10)
+  const top = P(lm, 10, new THREE.Vector3()), chin = P(lm, 152, new THREE.Vector3());
+  y.subVectors(top, chin);
+  const faceH = y.length();
+  y.normalize();
+  z.crossVectors(x, y).normalize();
+  y.crossVectors(z, x).normalize();
+  m.makeBasis(x, y, z); q.setFromRotationMatrix(m);
+  const faceW = P(lm, 454, a).distanceTo(P(lm, 234, b));
+  const radius = Math.max(0.78 * faceW, 0.74 * faceH);
+  c.addVectors(top, chin).multiplyScalar(0.5)
+    .addScaledVector(y, 0.06 * faceH)
+    .addScaledVector(z, -0.35 * radius);
+  return { pos: c.clone(), quat: q.clone(), radius };
+}
+function blend(bs, name) {
+  if (!bs) return 0;
+  const c = bs.categories.find((k) => k.categoryName === name);
+  return c ? c.score : 0;
+}
+
+let lastVideoTime = -1, seenFace = false;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    const faces = res.faceLandmarks || [];
+    pumpkins.forEach((p, i) => {
+      const lm = faces[i];
+      if (!lm) return p.hide();
+      const { pos, quat, radius } = poseFromLandmarks(lm);
+      p.setPose(pos, quat, radius);
+      const bs = res.faceBlendshapes && res.faceBlendshapes[i];
+      const jaw = Math.min(1, blend(bs, "jawOpen") * 1.6);
+      const smile = Math.min(1, (blend(bs, "mouthSmileLeft") + blend(bs, "mouthSmileRight")) * 0.7);
+      p.setExpression(jaw, blend(bs, "eyeBlinkLeft"), blend(bs, "eyeBlinkRight"), smile);
+    });
+    if (faces.length && !seenFace) { seenFace = true; hint.style.opacity = 0; }
+    if (!faces.length && seenFace) { seenFace = false; hint.style.opacity = 1; }
+  }
+  // candle flicker
+  const t = now / 1000;
+  const f = flicker ? 1.25 + 0.25 * Math.sin(t * 13) * Math.sin(t * 7.3) + 0.12 * Math.sin(t * 31) : 1.4;
+  pumpkins.forEach((p) => (p.mat.emissiveIntensity = f));
+  renderer.render(scene, camera);
+}
+
+/* ---------------- startup ---------------- */
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise((r) => (video.onloadedmetadata = r));
+  await video.play();
+  stage.classList.toggle("mirror", facing === "user");
+  layout();
+}
+
+async function loadLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(MP_WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MP_MODEL, delegate },
+    runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: true,
+  });
+  try { return await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { console.warn("GPU delegate failed, using CPU", e); return await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+$("startBtn").addEventListener("click", async () => {
+  const btn = $("startBtn"); btn.disabled = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser can't open the camera here. Use https:// or http://localhost.");
+    statusEl.textContent = "Opening camera…";
+    await startCamera();
+    statusEl.textContent = "Loading face tracker…";
+    landmarker = await loadLandmarker();
+    $("intro").classList.add("hidden");
+    $("bar").classList.remove("hidden");
+    hint.classList.remove("hidden");
+    requestAnimationFrame(loop);
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = (e && e.name === "NotAllowedError") ? "Camera permission was denied." : ("Couldn't start: " + (e.message || e));
+    btn.disabled = false;
+  }
+});
+
+$("flipBtn").addEventListener("click", async () => {
+  facing = facing === "user" ? "environment" : "user";
+  try { await startCamera(); pumpkins.forEach((p) => p.hide()); }
+  catch (e) { facing = facing === "user" ? "environment" : "user"; }
+});
+
+$("glowBtn").addEventListener("click", (e) => {
+  flicker = !flicker; e.target.textContent = "Flicker: " + (flicker ? "on" : "off");
+});
+
+$("snapBtn").addEventListener("click", () => {
+  const out = document.createElement("canvas"); out.width = W; out.height = H;
+  const ctx = out.getContext("2d");
+  if (facing === "user") { ctx.translate(W, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.drawImage(glCanvas, 0, 0, W, H);
+  const flash = $("flash"); flash.style.opacity = 0.8; setTimeout(() => (flash.style.opacity = 0), 120);
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "pumpkin-head-" + Date.now() + ".png";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }, "image/png");
+});
+</script>
+</body>
+</html>
