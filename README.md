@@ -1,6 +1,6 @@
 # Pumpkin Head AR
 
-A web AR toy that tracks your face with MediaPipe and puts a 3D jack-o'-lantern hat on top of your head. Open your mouth to make it grin, blink to make it blink.
+A web AR toy that tracks your face with MediaPipe and masks your face with a 3D jack-o'-lantern. Open your mouth to make it grin, blink to make it blink.
 
 **Live:** https://allenyulunwu.github.io/pumpkin-ar/
 
